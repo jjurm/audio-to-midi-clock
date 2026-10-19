@@ -14,7 +14,11 @@ Listens to live percussion (cajon, drum kit, anything with hits) and sends MIDI 
 
 ### Calibration
 
-Detection works out of the box; **Sensitivity** on the Inputs screen is the everyday knob. To make it pickier, go to **Calibrate**, press **Record hits** and play the sounds that should count, then **Record noise** and make the sounds that should be ignored (knocks on the stand, other instruments). The app learns to tell them apart from loudness, attack and brightness on each channel.
+Detection works out of the box; **Sensitivity** on the Inputs screen is the everyday knob. To teach the app your sounds, go to **Calibrate** and press **Record hits**. A cursor sweeps across a two-second window; hit once each time it crosses the centre line. The app doesn't need clean recordings: in each sweep the loudest moment near the centre becomes a hit example, and everything else in the sweep, including the drum's ringing and any room noise, becomes a noise example. Record each kind of sound that should count, like bass and slap, and use **Record noise** for sounds that should never count. Each sweep appears under Recent sweeps; tap the right spot if the wrong moment was picked, or delete it.
+
+The calibrated detector compares every audio frame with the saved examples (levels and rises in eight frequency bands per channel) and counts it as a hit when it is closer to some hit example than to any noise example, so any number of different sounds can count.
+
+The **Filters** graph on the same screen shows each channel's live spectrum before and after its filters; drag the high-pass and low-pass handles in from the sides to cut rumble or hiss.
 
 ### Latency test
 

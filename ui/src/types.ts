@@ -68,8 +68,18 @@ export interface EngineState {
   strength: number;
   threshold: number;
   reference: number;
-  peaks: { age: number; accepted: boolean; label: boolean | null; strength: number }[];
-  calibration: { hits: number; noise: number; mismatched: number; trained: boolean; recording: "hits" | "noise" | null };
+  peaks: { age: number; accepted: boolean; strength: number }[];
+  calibration: {
+    hits: number;
+    noise: number;
+    mismatched: number;
+    trained: boolean;
+    recording: "hits" | "noise" | null;
+    sweep: { position: number; length_s: number; tolerance_s: number; trace: number[] } | null;
+    history_version: number;
+    min_hits: number;
+    min_noise: number;
+  };
   learning: string | null;
   message: string;
   click: boolean;

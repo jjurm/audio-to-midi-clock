@@ -409,19 +409,8 @@ button {
 }
 
 .dot.noise {
-  border: 2px solid var(--bad);
-}
-
-.dot.labelled {
-  box-shadow: 0 0 0 3px var(--panel), 0 0 0 5px currentColor;
-}
-
-.dot.hit.labelled {
-  color: var(--led);
-}
-
-.dot.noise.labelled {
-  color: var(--bad);
+  border: 2px solid var(--muted);
+  opacity: 0.8;
 }
 
 .strip-legend {
@@ -451,9 +440,17 @@ button {
 }
 
 .key.noise::before {
-  border: 2px solid var(--bad);
   width: 5px;
   height: 5px;
+  border: 2px solid var(--muted);
+}
+
+.key.size::before {
+  width: 5px;
+  height: 5px;
+  background: var(--led);
+  box-shadow: 9px -2px 0 3px var(--led);
+  margin-right: 18px;
 }
 
 .key.now::before {
@@ -653,6 +650,83 @@ input[type="number"] {
 .port-list {
   display: flex;
   flex-direction: column;
+}
+
+/* ----- calibration ----- */
+
+.scope-wrap {
+  margin: 4px 0 10px;
+}
+
+.scope {
+  display: block;
+  width: 100%;
+  height: 170px;
+  border-radius: 10px;
+}
+
+.scope-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.sweeps {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.sweep {
+  margin: 0;
+}
+
+.thumb {
+  display: block;
+  width: 100%;
+  height: 54px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+.thumb.pickable {
+  cursor: crosshair;
+}
+
+.sweep.missed .thumb,
+.sweep.ambiguous .thumb {
+  border-style: dashed;
+}
+
+.sweep figcaption {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.sweep.accepted figcaption,
+.sweep.chosen figcaption {
+  color: var(--text);
+}
+
+.sweep .chip {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.spectrum {
+  display: block;
+  width: 100%;
+  height: 240px;
+  margin-top: 12px;
+  border-radius: 10px;
+  touch-action: none;
+  cursor: ew-resize;
 }
 
 /* ----- controls ----- */

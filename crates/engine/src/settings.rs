@@ -198,6 +198,9 @@ pub struct Example {
     /// Hit strength at the time of recording.
     pub strength: f32,
     pub features: Vec<f32>,
+    /// Calibration sweep the example came from.
+    #[serde(default)]
+    pub sweep: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

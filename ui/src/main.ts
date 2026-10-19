@@ -3,6 +3,7 @@ import "./style.css";
 import type { AudioDevice, Backend, EngineState, HostStatus, Persist, Settings } from "./types";
 import { h, clear } from "./dom";
 import { describeSource } from "./describe";
+import { drawScope, drawSpectrum, drawThumb, freqToX, xToFreq, type SpectrumView, type SweepView } from "./canvas";
 
 const isDesktop = "__TAURI_INTERNALS__" in window;
 const backend: Backend = isDesktop
@@ -30,6 +31,8 @@ let screen: ScreenId = (localStorage.getItem("screen") as ScreenId) || "play";
 let liveUpdaters: (() => void)[] = [];
 /** Called when settings change; update controls that aren't being edited. */
 let refreshers: (() => void)[] = [];
+/** Called when the screen is left (timers, animation loops). */
+let cleanups: (() => void)[] = [];
 /** Signature of the data the current screen's structure depends on. */
 let structureKey = "";
 
@@ -176,6 +179,8 @@ function computeStructureKey() {
 }
 
 function renderScreen() {
+  cleanups.forEach((f) => f());
+  cleanups = [];
   liveUpdaters = [];
   refreshers = [];
   structureKey = computeStructureKey();
@@ -202,21 +207,32 @@ function renderHostStatus() {
 
 // ----- shared widgets ---------------------------------------------------------
 
-/** Recent detected sounds on a 3-second timeline, newest on the right. */
+/** Recent sounds on a 3-second timeline, newest on the right. */
 function hitStrip() {
   const strip = h("div", { class: "hit-strip", "aria-hidden": "true" });
   liveUpdaters.push(() => {
     clear(strip);
     for (const p of state.peaks) {
-      const cls = p.label === true ? "hit labelled" : p.label === false ? "noise labelled" : p.accepted ? "hit" : "noise";
       const size = Math.min(1, p.strength / Math.max(1, state.reference));
-      const dot = h("span", { class: `dot ${cls}` });
+      const dot = h("span", { class: `dot ${p.accepted ? "hit" : "noise"}` });
       dot.style.left = `${100 - (p.age / 3) * 100}%`;
-      dot.style.setProperty("--s", String(0.5 + 0.5 * size));
+      dot.style.setProperty("--s", String(0.45 + 0.55 * size));
       strip.append(dot);
     }
   });
-  return h("div", { class: "strip-wrap" }, strip, h("div", { class: "strip-legend" }, h("span", { class: "key hit" }, "counted"), h("span", { class: "key noise" }, "ignored"), h("span", { class: "key now" }, "now")));
+  return h(
+    "div",
+    { class: "strip-wrap" },
+    strip,
+    h(
+      "div",
+      { class: "strip-legend" },
+      h("span", { class: "key hit" }, "Counted as a hit"),
+      h("span", { class: "key noise" }, "Heard, ignored"),
+      h("span", { class: "key size" }, "Bigger is louder"),
+      h("span", { class: "key now" }, "Now"),
+    ),
+  );
 }
 
 // ----- Play -------------------------------------------------------------------
@@ -359,40 +375,216 @@ function renderInputs() {
 
 // ----- Calibrate --------------------------------------------------------------
 
+const SWEEP_STATUS: Record<SweepView["status"], string> = {
+  accepted: "Hit found",
+  chosen: "Hit chosen by you",
+  missed: "Nothing stood out. Tap the hit to use it.",
+  ambiguous: "Something else was as loud. Tap the hit to use it.",
+  noise: "Noise",
+};
+
 function renderCalibrate() {
   const sec = h("section", { class: "form" });
-  sec.append(h("h2", {}, "Hits and noise"));
+
+  // Sounds: recording takes.
+  sec.append(h("h2", {}, "Sounds that count"));
   sec.append(
     h(
       "p",
       { class: "lead" },
-      "Record a few examples of sounds that should count, then sounds that should be ignored, like knocks on the stand or other instruments. Detection works without this; calibration makes it pickier.",
+      "Press Record hits and hit once each time the cursor crosses the centre line. The loudest moment near the centre becomes a hit example, and everything else in the sweep becomes a noise example. Record each kind of sound you want counted, like bass and slap, in any order. Record noise to add sounds that should never count.",
     ),
   );
-  const enterBtn = h("button", { class: "secondary" }) as HTMLButtonElement;
-  enterBtn.addEventListener("click", () => action("calibration"));
   const hitsBtn = h("button", { class: "record hits" }) as HTMLButtonElement;
   hitsBtn.addEventListener("click", () => action("record_hits"));
   const noiseBtn = h("button", { class: "record noise" }) as HTMLButtonElement;
   noiseBtn.addEventListener("click", () => action("record_noise"));
-  const clearBtn = h("button", { class: "secondary" }, "Clear examples");
+  const clearBtn = h("button", { class: "secondary" }, "Delete all examples");
   clearBtn.addEventListener("click", () => {
     if (confirm("Delete all recorded hit and noise examples?")) action("clear_calibration");
   });
+  const scope = h("canvas", { class: "scope", "aria-label": "Recording sweep" }) as HTMLCanvasElement;
+  const scopeHint = h("p", { class: "scope-hint" });
   const counts = h("p", { class: "counts" });
+  sec.append(h("div", { class: "row-buttons" }, hitsBtn, noiseBtn, clearBtn), h("div", { class: "scope-wrap" }, scope, scopeHint), counts);
+
+  // Scope animation: extrapolate the cursor between status polls.
+  let polledAt = performance.now();
+  let lastPos = 0;
+  let previous: number[] | null = null;
+  let lastTrace: number[] = [];
   liveUpdaters.push(() => {
     const c = state.calibration;
-    const on = state.mode === "calibrating";
-    enterBtn.textContent = on ? "Leave calibration" : "Enter calibration";
-    hitsBtn.textContent = c.recording === "hits" ? "Stop recording hits" : "Record hits";
-    noiseBtn.textContent = c.recording === "noise" ? "Stop recording noise" : "Record noise";
+    const sw = c.sweep;
+    hitsBtn.textContent = c.recording === "hits" ? "Stop recording" : "Record hits";
+    noiseBtn.textContent = c.recording === "noise" ? "Stop recording" : "Record noise";
     hitsBtn.classList.toggle("active", c.recording === "hits");
     noiseBtn.classList.toggle("active", c.recording === "noise");
-    const status = c.trained ? "Classifier on." : c.hits + c.noise > 0 ? "Needs at least 3 of each to sort hits from noise." : "No examples yet.";
-    counts.textContent = `${c.hits} hits, ${c.noise} noise. ${status}${c.mismatched ? ` ${c.mismatched} examples were recorded with a different input and are not used.` : ""}`;
+    if (sw) {
+      if (sw.position < lastPos) previous = lastTrace;
+      lastPos = sw.position;
+      lastTrace = sw.trace;
+      polledAt = performance.now();
+    } else {
+      previous = null;
+      lastPos = 0;
+      lastTrace = [];
+    }
+    scopeHint.textContent = !c.recording
+      ? "Press Record hits or Record noise to start."
+      : c.recording === "hits"
+        ? "Hit once when the cursor crosses the centre line."
+        : "Make the sounds that should be ignored. Every sweep becomes noise examples.";
+    const status = c.trained
+      ? "The detector is using your examples."
+      : `The detector starts using examples once there are ${c.min_hits} hits and ${c.min_noise} noise examples.`;
+    counts.textContent = `${c.hits} hit examples, ${c.noise} noise examples. ${status}${c.mismatched ? ` ${c.mismatched} examples were recorded with a different input setup and are not used.` : ""}`;
   });
-  sec.append(h("div", { class: "row-buttons" }, enterBtn, hitsBtn, noiseBtn, clearBtn), counts, hitStrip());
+  let raf = 0;
+  const frame = () => {
+    const c = state.calibration;
+    const sw = c.sweep;
+    if (sw && c.recording) {
+      const pos = Math.min(1, lastPos + (performance.now() - polledAt) / 1000 / sw.length_s);
+      drawScope(scope, { take: c.recording, position: pos, toleranceFrac: sw.tolerance_s / sw.length_s, trace: lastTrace, previous, points: 200, lengthS: sw.length_s });
+    } else {
+      drawScope(scope, { take: "noise", position: 0, toleranceFrac: 0, trace: [], previous: null, points: 200, lengthS: 2 });
+    }
+    raf = requestAnimationFrame(frame);
+  };
+  raf = requestAnimationFrame(frame);
+  cleanups.push(() => cancelAnimationFrame(raf));
 
+  // Review of recent sweeps.
+  sec.append(h("h2", {}, "Recent sweeps"));
+  sec.append(h("p", { class: "lead" }, "The amber line marks the hit that was saved. If it is wrong, tap the hit you meant. Delete sweeps you don't want to keep."));
+  const review = h("div", { class: "sweeps" });
+  sec.append(review);
+  let historyVersion = -1;
+  const loadHistory = async () => {
+    const list: SweepView[] = await backend.rpc({ cmd: "calib_history" });
+    clear(review);
+    if (list.length === 0) review.append(h("p", { class: "note" }, "No sweeps recorded since the app started. Saved examples are kept."));
+    for (const sw of list) {
+      const canvas = h("canvas", { class: "thumb" }) as HTMLCanvasElement;
+      let hover: number | null = null;
+      const draw = () => drawThumb(canvas, sw, 200, hover);
+      if (sw.take === "hits") {
+        canvas.classList.add("pickable");
+        canvas.addEventListener("pointermove", (e) => {
+          hover = e.offsetX / canvas.clientWidth;
+          draw();
+        });
+        canvas.addEventListener("pointerleave", () => {
+          hover = null;
+          draw();
+        });
+        canvas.addEventListener("click", (e) => {
+          backend.rpc({ cmd: "calib_choose", id: sw.id, position: e.offsetX / canvas.clientWidth });
+        });
+      }
+      const del = h("button", { class: "chip", "aria-label": "Delete this sweep" }, "Delete");
+      del.addEventListener("click", () => backend.rpc({ cmd: "calib_delete", id: sw.id }));
+      const label = sw.take === "noise" ? "Noise" : SWEEP_STATUS[sw.status];
+      review.append(h("figure", { class: `sweep ${sw.status}` }, canvas, h("figcaption", {}, h("span", {}, label), del)));
+      requestAnimationFrame(draw);
+    }
+  };
+  liveUpdaters.push(() => {
+    if (state.calibration.history_version !== historyVersion) {
+      historyVersion = state.calibration.history_version;
+      loadHistory();
+    }
+  });
+
+  // Filters with a live spectrum.
+  sec.append(h("h2", {}, "Filters"));
+  sec.append(
+    h(
+      "p",
+      { class: "lead" },
+      "The grey area is what the input hears, the amber line what is left after the channel's filters. Drag the handles in from the sides to cut rumble or hiss the hits don't need. Drag a handle back to its edge to turn it off.",
+    ),
+  );
+  const savedCh = Number(localStorage.getItem("filterChannel") ?? 0);
+  let ch = Math.min(savedCh, Math.max(0, state.channels - 1));
+  const chSelect = h("select") as HTMLSelectElement;
+  for (let i = 0; i < state.channels; i++) {
+    const o = h("option", { value: String(i) }, inputName(i)) as HTMLOptionElement;
+    if (i === ch) o.selected = true;
+    chSelect.append(o);
+  }
+  chSelect.addEventListener("change", () => {
+    ch = Number(chSelect.value);
+    localStorage.setItem("filterChannel", String(ch));
+    smoothRaw = null;
+    smoothFiltered = null;
+  });
+  const graph = h("canvas", { class: "spectrum", "aria-label": "Frequency graph with filter handles" }) as HTMLCanvasElement;
+  sec.append(field("Channel", chSelect), graph);
+
+  let view: SpectrumView | null = null;
+  let smoothRaw: number[] | null = null;
+  let smoothFiltered: number[] | null = null;
+  let dragging: "hp" | "lp" | null = null;
+  let dragHz = 0;
+  const filterOf = (which: "hp" | "lp") => persist.settings.channels[ch]?.[which === "hp" ? "highpass_hz" : "lowpass_hz"] ?? 0;
+  const redraw = () => {
+    if (!view) return;
+    view.highpass = dragging === "hp" ? dragHz : filterOf("hp");
+    view.lowpass = dragging === "lp" ? dragHz : filterOf("lp");
+    drawSpectrum(graph, view, dragging);
+  };
+  const smooth = (prev: number[] | null, next: number[]) => (prev && prev.length === next.length ? prev.map((p, i) => p + (next[i] - p) * 0.35) : next);
+  const pollSpectrum = async () => {
+    const r = await backend.rpc({ cmd: "spectrum", channel: ch });
+    if (r.error) return;
+    smoothRaw = smooth(smoothRaw, r.raw);
+    smoothFiltered = smooth(smoothFiltered, r.filtered);
+    view = { minHz: r.min_hz, maxHz: r.max_hz, raw: smoothRaw!, filtered: smoothFiltered!, highpass: 0, lowpass: 0 };
+    redraw();
+  };
+  const timer = window.setInterval(pollSpectrum, 80);
+  cleanups.push(() => clearInterval(timer));
+  refreshers.push(redraw);
+
+  // Dragging the filter edges.
+  let lastSent = 0;
+  const send = (final: boolean) => {
+    if (!dragging) return;
+    const now = performance.now();
+    if (!final && now - lastSent < 120) return;
+    lastSent = now;
+    setPath(["channels", ch, dragging === "hp" ? "highpass_hz" : "lowpass_hz"], Math.round(dragHz));
+  };
+  graph.addEventListener("pointerdown", (e) => {
+    if (!view) return;
+    const w = graph.clientWidth;
+    const hpX = filterOf("hp") > 0 ? freqToX(filterOf("hp"), view, w) : 0;
+    const lpX = filterOf("lp") > 0 ? freqToX(filterOf("lp"), view, w) : w;
+    dragging = Math.abs(e.offsetX - hpX) <= Math.abs(e.offsetX - lpX) ? "hp" : "lp";
+    graph.setPointerCapture(e.pointerId);
+    graph.dispatchEvent(new PointerEvent("pointermove", e));
+  });
+  graph.addEventListener("pointermove", (e) => {
+    if (!dragging || !view) return;
+    const w = graph.clientWidth;
+    const x = Math.max(0, Math.min(w, e.offsetX));
+    // Within a few pixels of its own edge, a handle turns the filter off.
+    const off = dragging === "hp" ? x < 6 : x > w - 6;
+    dragHz = off ? 0 : xToFreq(x, view, w);
+    redraw();
+    send(false);
+  });
+  const end = () => {
+    send(true);
+    dragging = null;
+    redraw();
+  };
+  graph.addEventListener("pointerup", end);
+  graph.addEventListener("pointercancel", end);
+
+  // Latency test.
   sec.append(h("h2", {}, "Latency"));
   sec.append(
     h(

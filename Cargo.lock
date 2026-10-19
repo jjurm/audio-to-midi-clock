@@ -122,7 +122,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-to-midi-clock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "engine",
@@ -909,7 +909,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "engine-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "engine",
 ]

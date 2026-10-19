@@ -16,10 +16,11 @@ use std::collections::VecDeque;
 
 use serde_json::{Value, json};
 
-use calibration::Classifier;
+use calibration::{Detector, Recorder, Sweep, Take};
 use controls::{ACTIONS, MidiParser};
 use dsp::{FEATURES_PER_CHANNEL, FrontEnd};
-use settings::{Binding, ChannelSettings, Example, Persist, Settings};
+
+use settings::{Binding, ChannelSettings, Persist, Settings};
 use tracker::Tracker;
 
 /// MIDI clock pulses per quarter note.
@@ -107,7 +108,6 @@ struct Peak {
     time: f64,
     strength: f32,
     accepted: bool,
-    label: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -115,8 +115,7 @@ struct PeakPicker {
     s1: f32,
     s2: f32,
     y1: f32,
-    p1: f32,
-    feats1: Vec<f32>,
+    y2: f32,
     last_peak: f64,
 }
 
@@ -133,8 +132,7 @@ pub struct Engine {
     version: u64,
     fe: FrontEnd,
     tracker: Option<Tracker>,
-    classifier: Option<Classifier>,
-    reference_db: f32,
+    detector: Option<Detector>,
     mode: Mode,
     count_in: VecDeque<f64>,
     clock: Option<Clock>,
@@ -143,7 +141,10 @@ pub struct Engine {
     tap_period: Option<f64>,
     last_loud: f64,
     last_bpm: Option<f64>,
-    recording: Option<bool>,
+    recorder: Option<Recorder>,
+    sweeps: VecDeque<Sweep>,
+    next_sweep: u64,
+    history_version: u64,
     picker: PeakPicker,
     peaks: VecDeque<Peak>,
     latency: Option<LatencyTest>,
@@ -165,8 +166,7 @@ impl Engine {
             version: 0,
             fe,
             tracker: None,
-            classifier: None,
-            reference_db: DEFAULT_REFERENCE_DB,
+            detector: None,
             mode: Mode::Stopped,
             count_in: VecDeque::new(),
             clock: None,
@@ -175,7 +175,10 @@ impl Engine {
             tap_period: None,
             last_loud: 0.0,
             last_bpm: None,
-            recording: None,
+            recorder: None,
+            sweeps: VecDeque::new(),
+            next_sweep: 0,
+            history_version: 0,
             picker: PeakPicker::default(),
             peaks: VecDeque::new(),
             latency: None,
@@ -260,6 +263,9 @@ impl Engine {
         self.fe = FrontEnd::new(sample_rate, &self.persist.settings.channels);
         self.picker = PeakPicker::default();
         self.peaks.clear();
+        self.recorder = None;
+        self.sweeps.clear();
+        self.history_version += 1;
         self.retrain();
     }
 
@@ -352,11 +358,11 @@ impl Engine {
             "calibration_leave" => self.leave_calibration(),
             "record_hits" => self.toggle_recording(true),
             "record_noise" => self.toggle_recording(false),
-            "record_stop" => self.recording = None,
+            "record_stop" => self.leave_calibration(),
             "clear_calibration" => {
                 self.persist.examples.clear();
-                self.retrain();
-                self.version += 1;
+                self.sweeps.clear();
+                self.calibration_changed();
                 self.message = "Calibration cleared".into();
             }
             "latency_test" => self.start_latency_test(),
@@ -439,6 +445,18 @@ impl Engine {
                 self.configure(sr, ch.max(1));
                 json!({ "ok": true })
             }
+            "calib_history" => self.sweep_history(),
+            "calib_choose" => {
+                let id = v.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let pos = v.get("position").and_then(Value::as_f64).unwrap_or(0.5);
+                self.choose_hit(id, pos);
+                json!({ "ok": true })
+            }
+            "calib_delete" => {
+                self.delete_sweep(v.get("id").and_then(Value::as_u64).unwrap_or(0));
+                json!({ "ok": true })
+            }
+            "spectrum" => self.spectrum(v.get("channel").and_then(Value::as_u64).unwrap_or(0) as usize),
             "clear_message" => {
                 self.message.clear();
                 json!({ "ok": true })
@@ -492,54 +510,61 @@ impl Engine {
     }
 
     fn thresholds(&self) -> (f32, f32) {
-        let r = self.reference_db * self.sensitivity_factor();
+        let r = DEFAULT_REFERENCE_DB * self.sensitivity_factor();
         (r, 0.35 * r)
     }
 
     fn on_frame(&mut self) {
         let t = self.now();
         let (s_ref, s_min) = self.thresholds();
+        self.fe.features(&mut self.feats);
         let mut s = 0.0f32;
-        for (f, cs) in self.fe.frames.iter().zip(&self.persist.settings.channels) {
+        let mut flux = 0.0f32;
+        let mut level = -120.0f32;
+        for (ci, (f, cs)) in self.fe.frames.iter().zip(&self.persist.settings.channels).enumerate() {
             if !cs.enabled {
+                let a = ci * FEATURES_PER_CHANNEL;
+                self.feats[a..a + FEATURES_PER_CHANNEL].iter_mut().for_each(|v| *v = 0.0);
                 continue;
             }
             let gate = ((f.above_floor - 3.0) / 6.0).clamp(0.0, 1.0);
-            s = s.max(cs.weight * f.rise[0] * gate);
+            s = s.max(cs.weight * f.rise * gate);
+            flux += cs.weight * f.flux() * gate;
+            level = level.max(f.level);
         }
         self.strength_meter = self.strength_meter.max(s);
-        let rec_threshold = if self.mode == Mode::Calibrating { 0.5 * s_min } else { s_min };
-        let mut p_hit = 1.0;
-        let mut y = 0.0;
-        if s >= rec_threshold {
-            self.fe.features(&mut self.feats);
-            if let Some(c) = &self.classifier {
-                p_hit = c.prob(&self.feats);
-            }
-            if s >= s_min {
-                y = (s / s_ref).min(2.0) * p_hit;
-            }
-        }
 
-        // Peak at the previous frame?
+        // Hit evidence for this frame, 0..2.
+        let y = match &self.detector {
+            Some(d) => {
+                if flux >= d.gate * self.sensitivity_factor() {
+                    let p = d.score(&self.feats);
+                    // Sensitivity moves the point where a frame counts as hit-like.
+                    let th = (0.5 + (50.0 - self.persist.settings.sensitivity) / 200.0).clamp(0.2, 0.8);
+                    ((p - th) / (1.0 - th)).clamp(0.0, 1.0) * (flux / d.reference).min(2.0)
+                } else {
+                    0.0
+                }
+            }
+            None if s >= s_min => (s / s_ref).min(2.0),
+            None => 0.0,
+        };
+
+        // Discrete hits for the display and the count-in: a local maximum of
+        // the raw strength, counted if the evidence around it is clear.
         let pk = &self.picker;
-        let is_peak = pk.s1 >= rec_threshold && pk.s1 >= pk.s2 && pk.s1 > s && t - pk.last_peak >= MIN_PEAK_GAP_S;
-        if is_peak {
+        let shown = 0.5 * s_min;
+        if pk.s1 >= shown && pk.s1 >= pk.s2 && pk.s1 > s && t - pk.last_peak >= MIN_PEAK_GAP_S {
             let hop = self.fe.hop_seconds();
-            let (ps, py, pp) = (pk.s1, pk.y1, pk.p1);
-            let feats = std::mem::take(&mut self.picker.feats1);
+            let evidence = pk.y1.max(pk.y2).max(y);
+            let strength = pk.s1;
             self.picker.last_peak = t - hop;
-            self.on_peak(t - hop, ps, py, pp, &feats);
-            self.picker.feats1 = feats;
+            self.on_peak(t - hop, strength, evidence >= 0.3);
         }
         self.picker.s2 = self.picker.s1;
         self.picker.s1 = s;
+        self.picker.y2 = self.picker.y1;
         self.picker.y1 = y;
-        self.picker.p1 = p_hit;
-        if s >= rec_threshold {
-            self.picker.feats1.clear();
-            self.picker.feats1.extend_from_slice(&self.feats);
-        }
 
         match self.mode {
             Mode::Running => {
@@ -555,25 +580,20 @@ impl Engine {
                     self.message = "Stopped after silence".into();
                 }
             }
+            Mode::Calibrating => {
+                if let Some(rec) = self.recorder.as_mut() {
+                    if let Some(sweep) = rec.push(&self.feats, flux, level, &mut self.next_sweep) {
+                        self.add_sweep(sweep);
+                    }
+                }
+            }
             Mode::LatencyTest => self.latency_frame(t),
             _ => {}
         }
     }
 
-    fn on_peak(&mut self, time: f64, strength: f32, y: f32, p_hit: f32, feats: &[f32]) {
-        let (_, s_min) = self.thresholds();
-        let accepted = strength >= s_min && p_hit >= 0.5 && y > 0.0;
-        let mut label = None;
-        if self.mode == Mode::Calibrating {
-            if let Some(hit) = self.recording {
-                label = Some(hit);
-                self.persist.examples.push(Example { hit, strength, features: feats.to_vec() });
-                calibration::trim(&mut self.persist.examples);
-                self.retrain();
-                self.version += 1;
-            }
-        }
-        self.peaks.push_back(Peak { time, strength, accepted, label });
+    fn on_peak(&mut self, time: f64, strength: f32, accepted: bool) {
+        self.peaks.push_back(Peak { time, strength, accepted });
         while self.peaks.len() > 64 {
             self.peaks.pop_front();
         }
@@ -812,16 +832,63 @@ impl Engine {
     }
 
     fn retrain(&mut self) {
-        let dims = self.feature_dims();
-        self.classifier = Classifier::train(&self.persist.examples, dims);
-        let mut hits: Vec<f32> =
-            self.persist.examples.iter().filter(|e| e.hit && e.features.len() == dims).map(|e| e.strength).collect();
-        self.reference_db = if hits.len() >= calibration::MIN_PER_CLASS {
-            hits.sort_by(f32::total_cmp);
-            hits[hits.len() / 2].max(2.0)
-        } else {
-            DEFAULT_REFERENCE_DB
-        };
+        self.detector = Detector::train(&self.persist.examples, self.feature_dims());
+        self.next_sweep = self.next_sweep.max(self.persist.examples.iter().map(|e| e.sweep).max().unwrap_or(0));
+    }
+
+    fn add_sweep(&mut self, sweep: Sweep) {
+        self.persist.examples.extend(sweep.examples());
+        calibration::trim(&mut self.persist.examples);
+        self.sweeps.push_front(sweep);
+        while self.sweeps.len() > calibration::HISTORY {
+            self.sweeps.pop_back();
+        }
+        self.calibration_changed();
+    }
+
+    fn calibration_changed(&mut self) {
+        self.retrain();
+        self.version += 1;
+        self.history_version += 1;
+    }
+
+    /// The player picked the hit of a sweep by hand.
+    fn choose_hit(&mut self, id: u64, position: f64) {
+        let hop = self.fe.hop_seconds();
+        let Some(sweep) = self.sweeps.iter_mut().find(|s| s.id == id) else { return };
+        if sweep.take != Take::Hits {
+            return;
+        }
+        calibration::choose(sweep, position, hop);
+        let examples = sweep.examples();
+        self.persist.examples.retain(|e| e.sweep != id);
+        self.persist.examples.extend(examples);
+        calibration::trim(&mut self.persist.examples);
+        self.calibration_changed();
+    }
+
+    fn delete_sweep(&mut self, id: u64) {
+        self.sweeps.retain(|s| s.id != id);
+        self.persist.examples.retain(|e| e.sweep != id);
+        self.calibration_changed();
+    }
+
+    fn sweep_history(&self) -> Value {
+        let frames = |s: &Sweep| s.frames().max(1) as f64;
+        Value::Array(
+            self.sweeps
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "take": if s.take == Take::Hits { "hits" } else { "noise" },
+                        "status": s.status.name(),
+                        "winner": s.winner.map(|w| w as f64 / frames(s)),
+                        "trace": s.trace,
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn enter_calibration(&mut self) {
@@ -837,7 +904,7 @@ impl Engine {
         if self.mode == Mode::Calibrating {
             self.mode = Mode::Stopped;
         }
-        self.recording = None;
+        self.recorder = None;
     }
 
     fn toggle_recording(&mut self, hits: bool) {
@@ -847,7 +914,13 @@ impl Engine {
                 return;
             }
         }
-        self.recording = if self.recording == Some(hits) { None } else { Some(hits) };
+        let take = if hits { Take::Hits } else { Take::Noise };
+        if self.recorder.as_ref().is_some_and(|r| r.take == take) {
+            // Pressing the same button again ends the take.
+            self.leave_calibration();
+        } else {
+            self.recorder = Some(Recorder::new(take, self.fe.hop_seconds()));
+        }
     }
 
     // ----- latency test ----------------------------------------------------
@@ -891,7 +964,7 @@ impl Engine {
         let Some(ch) = self.persist.settings.latency_test.listen_channel else { return };
         let Some(f) = self.fe.frames.get(ch) else { return };
         let gate = ((f.above_floor - 3.0) / 6.0).clamp(0.0, 1.0);
-        let s = f.rise[0] * gate;
+        let s = f.rise * gate;
         let hop = self.fe.hop_seconds();
         let Some(lt) = self.latency.as_mut() else { return };
         let p = &mut lt.picker;
@@ -948,6 +1021,24 @@ impl Engine {
 
     // ----- status ----------------------------------------------------------
 
+    /// Raw and filtered spectrum of one channel. The first call starts
+    /// collecting that channel; later calls return what was collected.
+    fn spectrum(&mut self, channel: usize) -> Value {
+        self.fe.set_tap(channel);
+        let sr = self.fe.sample_rate;
+        let (lo, hi) = (20.0f32, (sr / 2.0).min(20000.0));
+        let bins = 120;
+        match &self.fe.tap {
+            Some(t) => json!({
+                "min_hz": lo,
+                "max_hz": hi,
+                "raw": dsp::spectrum(&t.raw, t.pos, sr, lo, hi, bins),
+                "filtered": dsp::spectrum(&t.filtered, t.pos, sr, lo, hi, bins),
+            }),
+            None => json!({ "error": "no such channel" }),
+        }
+    }
+
     pub fn state(&mut self) -> Value {
         let now = self.now();
         let (s_ref, s_min) = self.thresholds();
@@ -972,7 +1063,7 @@ impl Engine {
             .peaks
             .iter()
             .filter(|p| now - p.time < 3.0)
-            .map(|p| json!({ "age": now - p.time, "accepted": p.accepted, "label": p.label, "strength": p.strength }))
+            .map(|p| json!({ "age": now - p.time, "accepted": p.accepted, "strength": p.strength }))
             .collect();
         let meters = self.fe.take_peaks();
         let strength = std::mem::take(&mut self.strength_meter);
@@ -1000,8 +1091,17 @@ impl Engine {
                 "hits": hits,
                 "noise": noise,
                 "mismatched": mismatched,
-                "trained": self.classifier.is_some(),
-                "recording": self.recording.map(|h| if h { "hits" } else { "noise" }),
+                "trained": self.detector.is_some(),
+                "recording": self.recorder.as_ref().map(|r| if r.take == Take::Hits { "hits" } else { "noise" }),
+                "sweep": self.recorder.as_ref().map(|r| json!({
+                    "position": r.position(),
+                    "length_s": calibration::SWEEP_S,
+                    "tolerance_s": r.tolerance_s(),
+                    "trace": r.trace(),
+                })),
+                "history_version": self.history_version,
+                "min_hits": calibration::MIN_HITS,
+                "min_noise": calibration::MIN_NOISE,
             },
             "learning": self.learning,
             "message": self.message,

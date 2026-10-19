@@ -195,33 +195,128 @@ fn stops_after_silence() {
     assert!(stop > 11.0 && stop < 13.5, "stop at {stop}");
 }
 
+/// Clutter that should never count: knocks and soft ghost notes at random times.
+fn clutter(audio: &mut [f32], from: f64, to: f64, avoid: &[f64], n: usize, rng: &mut Rng) -> Vec<f64> {
+    let mut placed = Vec::new();
+    while placed.len() < n {
+        let t = from + (rng.next() as f64 * 0.5 + 0.5) * (to - from);
+        if avoid.iter().chain(&placed).any(|a| (a - t).abs() < 0.15) {
+            continue;
+        }
+        let (sound, amp) = if placed.len() % 2 == 0 { (Sound::Noise, 0.5) } else { (Sound::Ghost, 0.4) };
+        add_sound(audio, t, sound, amp, rng);
+        placed.push(t);
+    }
+    placed
+}
+
+fn noisy_background(audio: &mut [f32], rng: &mut Rng) {
+    for s in audio.iter_mut() {
+        *s += 0.004 * rng.next();
+    }
+}
+
 #[test]
-fn rejects_noise_after_calibration() {
-    // Calibrate with hits and rumble, then check the rumble is rejected.
+fn calibration_in_a_noisy_room() {
     let mut e = Engine::new(SR, 1);
     let mut rng = Rng(5);
-    e.action("calibration_enter");
-    let feed = |e: &mut Engine, sound: Sound, amp: f32, n: usize, rng: &mut Rng| {
-        let mut audio = vec![0.0f32; (n as f64 * 0.5 * SR as f64) as usize];
-        background(&mut audio, rng);
-        for i in 0..n {
-            add_sound(&mut audio, i as f64 * 0.5 + 0.1, sound, amp, rng);
-        }
-        e.process(&audio);
-    };
-    feed(&mut e, Sound::Ghost, 0.0, 2, &mut rng);
+    let start = 0.5;
+    let mut warm = vec![0.0f32; (start * SR as f64) as usize];
+    noisy_background(&mut warm, &mut rng);
+    e.process(&warm);
+
+    // Hit take: one hit per sweep near the centre, two kinds of hit, clutter around.
     e.action("record_hits");
-    feed(&mut e, Sound::Slap, 0.6, 10, &mut rng);
+    let sweeps = 12;
+    let mut audio = vec![0.0f32; (sweeps as f64 * calibration::SWEEP_S * SR as f64) as usize];
+    noisy_background(&mut audio, &mut rng);
+    let mut hits = Vec::new();
+    for k in 0..sweeps {
+        let t0 = k as f64 * calibration::SWEEP_S;
+        let t = t0 + 1.0 + rng.next() as f64 * 0.12;
+        add_sound(&mut audio, t, if k % 2 == 0 { Sound::Bass } else { Sound::Slap }, 0.6, &mut rng);
+        hits.push(t);
+        clutter(&mut audio, t0 + 0.05, t0 + 1.95, &[t], 3, &mut rng);
+    }
+    e.process(&audio);
+
+    // Noise take: only clutter.
     e.action("record_noise");
-    feed(&mut e, Sound::Noise, 0.6, 10, &mut rng);
+    let mut audio = vec![0.0f32; (6.0 * calibration::SWEEP_S * SR as f64) as usize];
+    noisy_background(&mut audio, &mut rng);
+    let end = audio.len() as f64 / SR as f64 - 0.3;
+    clutter(&mut audio, 0.05, end, &[], 24, &mut rng);
+    e.process(&audio);
     e.action("record_stop");
-    let st = e.state();
-    assert!(st["calibration"]["trained"].as_bool().unwrap(), "{st}");
-    feed(&mut e, Sound::Noise, 0.6, 6, &mut rng);
-    let st = e.state();
-    let peaks = st["peaks"].as_array().unwrap();
-    let accepted = peaks.iter().filter(|p| p["accepted"].as_bool().unwrap()).count();
-    assert!(accepted <= 1, "accepted {accepted} of {}", peaks.len());
+
+    let history = e.sweep_history();
+    let list = history.as_array().unwrap();
+    let mut good = 0;
+    for s in list.iter().filter(|s| s["take"] == "hits") {
+        let id = s["id"].as_u64().unwrap() as usize;
+        let k = id - 1;
+        println!("sweep {k}: {}", s["status"]);
+        if s["status"] == "accepted" {
+            let w = s["winner"].as_f64().unwrap() * calibration::SWEEP_S;
+            let truth = hits[k] - k as f64 * calibration::SWEEP_S;
+            assert!((w - truth).abs() < 0.02, "sweep {k}: winner {w:.3} vs hit {truth:.3}");
+            good += 1;
+        }
+    }
+    println!("accepted sweeps: {good} of {sweeps}");
+    assert!(good >= 9);
+    assert!(e.detector.is_some());
+
+    // Playing: both kinds of hit count, clutter does not.
+    e.peaks.clear();
+    let base = e.now();
+    let dur = 12.0;
+    let mut audio = vec![0.0f32; (dur * SR as f64) as usize];
+    noisy_background(&mut audio, &mut rng);
+    let beats: Vec<f64> = (0..19).map(|i| 0.4 + i as f64 * 0.6).collect();
+    for (i, &b) in beats.iter().enumerate() {
+        add_sound(&mut audio, b, if i % 2 == 0 { Sound::Bass } else { Sound::Slap }, 0.6, &mut rng);
+    }
+    let junk = clutter(&mut audio, 0.3, dur - 0.5, &beats, 10, &mut rng);
+    e.process(&audio);
+    let near = |t: f64, set: &[f64]| set.iter().any(|&x| (base + x - t).abs() < 0.03);
+    let counted_hits = beats.iter().filter(|&&b| e.peaks.iter().any(|p| p.accepted && (p.time - base - b).abs() < 0.03)).count();
+    let counted_junk = e.peaks.iter().filter(|p| p.accepted && near(p.time, &junk)).count();
+    println!("hits counted {counted_hits}/{}, clutter counted {counted_junk}/{}", beats.len(), junk.len());
+    assert!(counted_hits >= beats.len() - 1);
+    assert!(counted_junk <= 1);
+}
+
+#[test]
+fn choosing_and_deleting_sweeps() {
+    let mut e = Engine::new(SR, 1);
+    let mut rng = Rng(9);
+    e.action("record_hits");
+    let mut audio = vec![0.0f32; (3.0 * calibration::SWEEP_S * SR as f64) as usize];
+    background(&mut audio, &mut rng);
+    for k in 0..3 {
+        add_sound(&mut audio, k as f64 * 2.0 + 1.0, Sound::Slap, 0.6, &mut rng);
+    }
+    e.process(&audio);
+    assert_eq!(e.sweeps.len(), 3);
+    let before = e.persist.examples.len();
+    e.rpc(r#"{"cmd":"calib_choose","id":2,"position":0.25}"#);
+    let s = e.sweeps.iter().find(|s| s.id == 2).unwrap();
+    assert_eq!(s.status, calibration::SweepStatus::Chosen);
+    e.rpc(r#"{"cmd":"calib_delete","id":1}"#);
+    assert_eq!(e.sweeps.len(), 2);
+    assert!(e.persist.examples.len() < before);
+    assert!(e.persist.examples.iter().all(|x| x.sweep != 1));
+}
+
+#[test]
+fn spectrum_rpc() {
+    let mut e = Engine::new(SR, 2);
+    e.rpc(r#"{"cmd":"spectrum","channel":1}"#);
+    let audio: Vec<f32> = (0..48000).flat_map(|i| [0.0, (i as f32 * 0.1).sin()]).collect();
+    e.process(&audio);
+    let v = e.rpc_value(&serde_json::json!({"cmd": "spectrum", "channel": 1}));
+    assert_eq!(v["raw"].as_array().unwrap().len(), 120);
 }
 
 #[test]
