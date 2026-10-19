@@ -522,8 +522,14 @@ window.addEventListener("keydown", (e) => {
   const source = `key:${e.code}`;
   if (state.learning || persist.settings.bindings.some((b) => b.source === source)) {
     e.preventDefault();
+    // Keep a bound key (e.g. Space) from also pressing the focused button.
+    (document.activeElement as HTMLElement | null)?.blur();
     backend.rpc({ cmd: "control", source });
   }
+});
+
+window.addEventListener("keyup", (e) => {
+  if (persist.settings.bindings.some((b) => b.source === `key:${e.code}`)) e.preventDefault();
 });
 
 // ----- polling --------------------------------------------------------------------
