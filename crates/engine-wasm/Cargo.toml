@@ -1,0 +1,12 @@
+[package]
+name = "engine-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly build of the engine with a plain C ABI (no JS glue needed)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }

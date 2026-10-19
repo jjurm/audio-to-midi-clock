@@ -1,0 +1,7 @@
+/target
+node_modules/
+/dist/
+/ui/public/engine.wasm
+/desktop/gen/
+*.log
+.DS_Store
