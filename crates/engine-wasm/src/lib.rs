@@ -112,6 +112,12 @@ pub extern "C" fn now() -> f64 {
     with(|s| s.engine.now())
 }
 
+/// Time of the last sample fed in, in seconds.
+#[unsafe(no_mangle)]
+pub extern "C" fn sample_time() -> f64 {
+    with(|s| s.engine.sample_time())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn persist_version() -> f64 {
     with(|s| s.engine.persist_version() as f64)

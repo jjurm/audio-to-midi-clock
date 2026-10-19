@@ -189,6 +189,11 @@ impl FrontEnd {
         self.hop as f64 / self.sample_rate as f64
     }
 
+    /// Total samples (per channel) pushed so far.
+    pub fn samples(&self) -> u64 {
+        self.frame_index * self.hop as u64 + self.counter as u64
+    }
+
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }

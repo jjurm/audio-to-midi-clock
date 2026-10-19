@@ -1,0 +1,28 @@
+[package]
+name = "audio-to-midi-clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turns live percussion audio into MIDI clock that follows the player"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+engine = { path = "../crates/engine" }
+gilrs = "0.11.2"
+midir = "0.11.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2", features = [] }
+
+# Every audio system cpal supports on each platform: ASIO next to WASAPI on
+# Windows, JACK next to ALSA on Linux.
+[target.'cfg(windows)'.dependencies]
+cpal = { version = "0.18.2", features = ["asio"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["jack"] }
+
+[target.'cfg(not(any(windows, target_os = "linux")))'.dependencies]
+cpal = "0.18.2"

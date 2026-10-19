@@ -1,0 +1,21 @@
+{
+  "name": "audio-to-midi-clock",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:wasm": "cargo build -p engine-wasm --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/engine_wasm.wasm ui/public/engine.wasm",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  },
+  "dependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@tauri-apps/api": "^2.12.4"
+  }
+}

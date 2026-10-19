@@ -205,6 +205,12 @@ impl Engine {
         self.fe.frame_index as f64 * self.fe.hop_seconds()
     }
 
+    /// Time of the last sample fed in, in seconds. Use this, not `now`, to
+    /// map engine times onto a host clock.
+    pub fn sample_time(&self) -> f64 {
+        self.fe.samples() as f64 / self.fe.sample_rate as f64
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
